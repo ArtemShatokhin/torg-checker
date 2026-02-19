@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Debug capture (Konfiskat failure)
+konfiskat_debug.html
+
 # Environments
 .env
 .envrc
