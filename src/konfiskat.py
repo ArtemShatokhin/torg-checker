@@ -137,21 +137,49 @@ def _save_debug_html(page, result: dict) -> None:
         result["details"] = f"Form/input not found. Could not save page: {e}"
 
 
+# Temporary id we inject to find the real KillBot thumb (cursor:pointer). Avoids relying on
+# exact track dimensions, which may be randomized.
+_KILLBOT_THUMB_ID = "kb-real-thumb"
+
+
 def _try_solve_killbot_slider(page, *, timeout_ms: int = 15000) -> bool:
     """
-    Try to pass the KillBot "swipe right" slider. The real slider is the one with
-    cursor:pointer; decoys use cursor:unset. Real track is 300x50 with border-radius 25px.
-    Thumb position is driven only by clientX, so we drag horizontally in screen space.
-    Returns True if the overlay disappeared and we can continue (e.g. form visible).
+    Try to pass the KillBot "swipe right" slider. The real thumb is the one with
+    cursor:pointer (decoys use cursor:unset). We find it by computed style and track
+    size range, not fixed pixels. Thumb position is driven only by clientX, so we drag
+    horizontally in screen space. Returns True if the overlay disappeared (form visible).
     """
     try:
-        # Real container: 300x50, border-radius 25px (decoys are 280x50, 22px)
-        container = page.locator(
-            "div[style*='width:300px'][style*='height:50px'][style*='border-radius:25px']"
-        ).first
-        container.wait_for(state="visible", timeout=timeout_ms)
-        thumb = container.locator("div[style*='cursor:pointer']").first
+        # Find the real thumb by behavior: only the real one has cursor:pointer. Track
+        # is any horizontal bar (width 200–400px, height ~40–60) so we don't depend on
+        # exact dimensions that KillBot might randomize.
+        found = page.evaluate(
+            f"""
+            () => {{
+                const id = "{_KILLBOT_THUMB_ID}";
+                const existing = document.getElementById(id);
+                if (existing) existing.removeAttribute("id");
+                for (const div of document.querySelectorAll("div")) {{
+                    const style = getComputedStyle(div);
+                    if (style.cursor !== "pointer") continue;
+                    const parent = div.parentElement;
+                    if (!parent) continue;
+                    const pr = parent.getBoundingClientRect();
+                    if (pr.width < 200 || pr.width > 400 || pr.height < 40 || pr.height > 60) continue;
+                    if (div.getBoundingClientRect().width > 80) continue;
+                    div.id = id;
+                    return true;
+                }}
+                return false;
+            }}
+            """
+        )
+        if not found:
+            return False
+
+        thumb = page.locator(f"#{_KILLBOT_THUMB_ID}")
         thumb.wait_for(state="visible", timeout=5000)
+        container = thumb.locator("xpath=..")
 
         box_thumb = thumb.bounding_box()
         box_container = container.bounding_box()
@@ -218,40 +246,53 @@ def check_konfiskat_with_page(page, vin: str, plate: str) -> dict:
                 result["details"] = "Konfiskat is protected by KillBot (captcha). Cannot check from this environment. The hourly GitHub Action may still reach the site from its network."
                 return result
 
-        form = page.locator("form#js-search-form").first
-        form.wait_for(state="attached", timeout=15000)
-        page.evaluate("if (typeof openFilterSearch === 'function') openFilterSearch();")
-        time.sleep(0.5)
-
-        query_input = page.locator("input[name='query']").first
-        query_input.wait_for(state="visible", timeout=10000)
-
-        for q in queries:
-            query_input.fill("")
-            query_input.fill(q)
-            time.sleep(0.2)
-            page.locator("form#js-search-form").locator("button[type='submit']").first.click()
-            page.wait_for_load_state("networkidle")
-            time.sleep(1)
-
-            content = page.content()
-            if _has_result_listings(content) and _page_contains_listing(content, vin or "", plate or ""):
-                result["found"] = True
-                result["url"] = page.url
-                result["details"] = f"Match for query '{q}' on konfiskat-gov.ru"
-                return result
-            if q != queries[-1]:
-                page.goto(KONFISKAT_AUTOS_URL, wait_until="domcontentloaded")
-                page.wait_for_load_state("networkidle")
-                time.sleep(2)
+        last_error = None
+        for attempt in range(2):
+            try:
+                form = page.locator("form#js-search-form").first
+                form.wait_for(state="attached", timeout=15000)
                 page.evaluate("if (typeof openFilterSearch === 'function') openFilterSearch();")
                 time.sleep(0.5)
+
                 query_input = page.locator("input[name='query']").first
                 query_input.wait_for(state="visible", timeout=10000)
 
-        result["details"] = "No matching listings"
+                for q in queries:
+                    query_input.fill("")
+                    query_input.fill(q)
+                    time.sleep(0.2)
+                    page.locator("form#js-search-form").locator("button[type='submit']").first.click()
+                    page.wait_for_load_state("networkidle")
+                    time.sleep(1)
+
+                    content = page.content()
+                    if _has_result_listings(content) and _page_contains_listing(content, vin or "", plate or ""):
+                        result["found"] = True
+                        result["url"] = page.url
+                        result["details"] = f"Match for query '{q}' on konfiskat-gov.ru"
+                        return result
+                    if q != queries[-1]:
+                        page.goto(KONFISKAT_AUTOS_URL, wait_until="domcontentloaded")
+                        page.wait_for_load_state("networkidle")
+                        time.sleep(2)
+                        page.evaluate("if (typeof openFilterSearch === 'function') openFilterSearch();")
+                        time.sleep(0.5)
+                        query_input = page.locator("input[name='query']").first
+                        query_input.wait_for(state="visible", timeout=10000)
+
+                result["details"] = "No matching listings"
+                break
+            except Exception as e:
+                last_error = e
+                if attempt == 0 and _try_solve_killbot_slider(page):
+                    logger.info("Form not found; passed KillBot on retry, continuing.")
+                    time.sleep(0.5)
+                else:
+                    _save_debug_html(page, result)
+                    logger.debug("Konfiskat failed: %s", last_error)
+                    break
+
     except Exception as e:
         _save_debug_html(page, result)
         logger.debug("Konfiskat failed: %s", e)
-
     return result

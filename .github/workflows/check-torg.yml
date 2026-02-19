@@ -37,6 +37,19 @@ jobs:
         continue-on-error: true
         id: check
 
+      - name: Set debug artifact flag
+        if: always()
+        id: debug
+        run: |
+          if [ -f konfiskat_debug.html ]; then echo "exists=true" >> $GITHUB_OUTPUT; else echo "exists=false" >> $GITHUB_OUTPUT; fi
+
+      - name: Upload Konfiskat debug HTML
+        if: always() && steps.debug.outputs.exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: konfiskat-debug-html
+          path: konfiskat_debug.html
+
       - name: Fail job if listing found
         if: steps.check.outcome == 'failure'
         run: |
